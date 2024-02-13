@@ -1,9 +1,19 @@
 package toxiproxy
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"errors"
+	"fmt"
+	"math/big"
 	"net"
+	"os"
 	"sync"
+	"time"
 
 	"github.com/rs/zerolog"
 	tomb "gopkg.in/tomb.v1"
@@ -19,19 +29,30 @@ import (
 type Proxy struct {
 	sync.Mutex
 
-	Name     string `json:"name"`
-	Listen   string `json:"listen"`
-	Upstream string `json:"upstream"`
-	Enabled  bool   `json:"enabled"`
+	Name     string   `json:"name"`
+	Listen   string   `json:"listen"`
+	Upstream string   `json:"upstream"`
+	Enabled  bool     `json:"enabled"`
+	TLS      *TlsData `json:"tls,omitempty"`
 
 	listener net.Listener
 	started  chan error
 
+	caCert      *tls.Certificate
 	tomb        tomb.Tomb
 	connections ConnectionList
 	Toxics      *ToxicCollection `json:"-"`
 	apiServer   *ApiServer
 	Logger      *zerolog.Logger
+}
+
+type TlsData struct {
+	Cert string `json:"cert"`
+	Key  string `json:"key"`
+	// When the cert and key represent a CA, this can is used to dynamically sign fake certificates created with proper CN
+	IsCA bool `json:"isCA,omitempty"`
+	// By default this is false (we are doing MITM attack so why bother with upstream certificate check)
+	VerifyUpstream bool `json:"verifyUpstream,omitempty"`
 }
 
 type ConnectionList struct {
@@ -103,20 +124,169 @@ func (proxy *Proxy) Stop() {
 	stop(proxy)
 }
 
+func (proxy *Proxy) getCertificate(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+	var name string
+
+	if hello.ServerName == "" {
+		name = "default"
+	} else {
+		name = hello.ServerName
+	}
+
+	proxy.Logger.
+		Info().
+		Str("proxy", proxy.Name).
+		Str("serverName", name).
+		Msg("getCertificate called")
+
+	if proxy.caCert == nil {
+		return nil, errors.New("no CA certificate found")
+	}
+
+	// Dynamically create new cert based on SNI
+	cert, err := createCertificate(*proxy.caCert, name)
+	if err != nil {
+		proxy.Logger.Info().
+			Str("proxy", proxy.Name).
+			Str("serverName", name).
+			Err(err)
+
+		return nil, err
+	}
+	return cert, nil
+}
+
+// Ensure the given file is a CA certificate
+func ensureCaCert(file string) error {
+	certFile, err := os.ReadFile(file)
+	if err != nil {
+		return err
+	}
+
+	block, _ := pem.Decode(certFile)
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return err
+	}
+
+	if cert.KeyUsage&x509.KeyUsageCertSign != x509.KeyUsageCertSign && !cert.IsCA {
+		return fmt.Errorf("the given certificate is not a CA cert - usage %d, isCA %t", cert.KeyUsage, cert.IsCA)
+	}
+
+	return nil
+}
+
+// Utility function to create new certificate with given common name signed with our CA
+func createCertificate(caTls tls.Certificate, commonName string) (*tls.Certificate, error) {
+	cert := &x509.Certificate{
+		SerialNumber: big.NewInt(1337),
+		Subject: pkix.Name{
+			Organization: []string{"Toxiproxy"},
+			CommonName:   commonName,
+		},
+		NotBefore:    time.Now(),
+		NotAfter:     time.Now().AddDate(1, 0, 0),
+		IsCA:         false,
+		SubjectKeyId: []byte{1, 2, 3, 4, 6},
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+	}
+
+	priv, _ := rsa.GenerateKey(rand.Reader, 2048)
+	pub := &priv.PublicKey
+
+	ca, err := x509.ParseCertificate(caTls.Certificate[0])
+	if err != nil {
+		return nil, err
+	}
+
+	certBlock, err := x509.CreateCertificate(rand.Reader, cert, ca, pub, caTls.PrivateKey)
+	if err != nil {
+		return nil, err
+	}
+
+	newCert, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBlock}),
+		pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(priv)}),
+	)
+
+	if err != nil {
+		return nil, err
+	}
+
+	return &newCert, nil
+}
+
 func (proxy *Proxy) listen() error {
-	var err error
-	proxy.listener, err = net.Listen("tcp", proxy.Listen)
+	var (
+		ln     net.Listener
+		err    error
+		config tls.Config
+	)
+
+	// Logging
+	if proxy.TLS != nil {
+		proxy.Logger.Info().
+			Str("proxy", proxy.Name).
+			Str("cert", proxy.TLS.Cert).
+			Str("key", proxy.TLS.Key).
+			Bool("isCA", proxy.TLS.IsCA).
+			Bool("verifyUpstream", proxy.TLS.VerifyUpstream).
+			Msg("TLS certificates were specified")
+
+		if proxy.TLS.IsCA {
+			err := ensureCaCert(proxy.TLS.Cert)
+			if err != nil {
+				proxy.started <- err
+				return err
+			}
+		}
+	} else {
+		proxy.Logger.
+			Info().
+			Str("proxy", proxy.Name).
+			Msg("TLS certificates were NOT specified")
+	}
+
+	// Action
+	if proxy.TLS != nil {
+		cert, err := tls.LoadX509KeyPair(proxy.TLS.Cert, proxy.TLS.Key)
+		if err != nil {
+			proxy.started <- err
+			return err
+		}
+
+		if proxy.TLS.IsCA {
+			config = tls.Config{GetCertificate: proxy.getCertificate}
+			proxy.caCert = &cert
+		} else {
+			config = tls.Config{Certificates: []tls.Certificate{cert}}
+			proxy.caCert = nil
+		}
+
+		config.Rand = rand.Reader
+
+		ln, err = tls.Listen("tcp", proxy.Listen, &config)
+		if err != nil {
+			proxy.started <- err
+			return err
+		}
+	} else {
+		ln, err = net.Listen("tcp", proxy.Listen)
+		if err != nil {
+			proxy.started <- err
+			return err
+		}
+	}
+
 	if err != nil {
 		proxy.started <- err
 		return err
 	}
+	proxy.listener = ln
 	proxy.Listen = proxy.listener.Addr().String()
 	proxy.started <- nil
-
-	proxy.Logger.
-		Info().
-		Msg("Started proxy")
-
 	return nil
 }
 
@@ -153,6 +323,7 @@ func (proxy *Proxy) server() {
 	if err != nil {
 		return
 	}
+	var upstream net.Conn
 
 	acceptTomb := &tomb.Tomb{}
 	defer acceptTomb.Done()
@@ -185,7 +356,35 @@ func (proxy *Proxy) server() {
 			Str("client", client.RemoteAddr().String()).
 			Msg("Accepted client")
 
-		upstream, err := net.Dial("tcp", proxy.Upstream)
+		if proxy.TLS != nil {
+			clientConfig := &tls.Config{InsecureSkipVerify: !proxy.TLS.VerifyUpstream}
+			upstreamTLS, errs := tls.Dial("tcp", proxy.Upstream, clientConfig)
+			err = errs
+			if err != nil {
+				proxy.Logger.Err(err).
+					Str("client", client.RemoteAddr().String()).
+					Str("proxy", proxy.Listen).
+					Str("upstream", proxy.Upstream).
+					Msg("Unable to open connection to upstream")
+				client.Close()
+				continue
+			}
+			upstream = upstreamTLS
+		} else {
+			upstreamPlain, errs := net.Dial("tcp", proxy.Upstream)
+			err = errs
+			if err != nil {
+				proxy.Logger.Err(err).
+					Str("client", client.RemoteAddr().String()).
+					Str("proxy", proxy.Listen).
+					Str("upstream", proxy.Upstream).
+					Msg("Unable to open connection to upstream")
+				client.Close()
+				continue
+			}
+
+			upstream = upstreamPlain
+		}
 		if err != nil {
 			proxy.Logger.
 				Err(err).
